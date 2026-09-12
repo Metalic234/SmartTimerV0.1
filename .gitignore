@@ -22,3 +22,28 @@ UserPrefs.ini
 *_.SchLib
 *.ddb
 *.csvopn
+
+# Firmware build artifacts (IAR/EWARM)
+*.o
+*.pbi
+*.xcl
+*.pbd
+*.pbw
+*.map
+*.hex
+*.out
+*.sim
+.ninja_log
+.ninja_deps
+build.ninja
+BrowseInfo/
+List/
+Obj/
+Exe/
+Backup of *
+*.cspy.bat
+*.cspy.ps1
+*.crun
+*.dbgdt
+*.dnx
+*.wsdt
