@@ -1,0 +1,24 @@
+# Altium Designer
+*.SchDoc.Zip
+*.PcbDoc.Zip
+*.PrjPcbStructure.Zip
+*.PrjPcbStructure
+History/
+__Previews/
+Outputs/
+Generated/
+Previews/
+Project Logs for *
+*.OutJob
+*.DsnWrk
+*.PrjPcb.Workspace
+UserPrefs.ini
+*.Rpt
+~$*
+*.bak
+*.BackupOf*
+*.~(??)
+*_.PcbLib
+*_.SchLib
+*.ddb
+*.csvopn

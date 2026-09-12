@@ -1,0 +1,417 @@
+/* main.c - Adjusted per request: short text, blink only selected number,
+   explicit repeat selection and corrected flow. */
+
+#include "main.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "stm32f0xx_hal.h"
+#include "character_lcd_conf.h"
+#include "character_lcd.h"
+
+/* States */
+typedef enum { ADJUST_SELECT = 0, ADJUST_EDIT, CHOOSE_REPEAT, RUN_CYCLE } AppState;
+static volatile AppState timerState = ADJUST_SELECT;
+
+/* Fields */
+typedef enum { FIELD_HOUR = 0, FIELD_MINUTE } Field;
+
+/* Simple button structure (no software debounce) */
+typedef struct {
+    uint16_t pin;
+    uint8_t last_raw;
+    uint32_t press_time;
+    bool short_event;
+    bool long_event;
+} BtnSimple;
+
+static BtnSimple btn_set, btn_inc, btn_dec;
+
+/* UI timing */
+static uint32_t last_ui_tick = 0;
+static const uint32_t UI_UPDATE_MS = 300;   /* UI refresh rate */
+static const uint32_t BLINK_MS = 500;       /* blink period */
+static const uint32_t LONG_PRESS_MS = 3000; /* long press threshold */
+
+/* Settings */
+static Field sel_field = FIELD_HOUR;
+static int hour = 0;
+static int minute = 0;
+
+/* Repeat: -1 -> X (infinite), 0..1000 numeric; default 0 */
+static int32_t repeat_value = 0;
+
+/* Run cycle runtime state */
+static bool run_init = false;
+static uint32_t phase_ms = 0;
+static uint32_t phase_remaining = 0;
+static bool phase_on = true;
+static int32_t cycles_done = 0;
+static uint32_t last_phase_tick = 0;
+
+/* Backlight */
+static GPIO_PinState backlight_state = GPIO_PIN_SET;
+
+/* Forward prototypes (replace if you already have them elsewhere) */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+void Error_Handler(void);
+
+/* Read raw button (pressed when GPIO_PIN_SET in your wiring) */
+static inline uint8_t ReadRaw(uint16_t pin) {
+    return (HAL_GPIO_ReadPin(GPIOA, pin) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+/* Sample buttons (no debounce): detect press->release and long vs short on release */
+static void sample_buttons_simple(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    /* SET */
+    uint8_t raw = ReadRaw(btn_set.pin);
+    if (raw && !btn_set.last_raw) { btn_set.press_time = now; }        /* press edge */
+    else if (!raw && btn_set.last_raw) {                              /* release edge */
+        if (btn_set.press_time) {
+            uint32_t d = now - btn_set.press_time;
+            if (d >= LONG_PRESS_MS) btn_set.long_event = true;
+            else btn_set.short_event = true;
+        }
+        btn_set.press_time = 0;
+    }
+    btn_set.last_raw = raw;
+
+    /* INC */
+    raw = ReadRaw(btn_inc.pin);
+    if (raw && !btn_inc.last_raw) { btn_inc.press_time = now; }
+    else if (!raw && btn_inc.last_raw) {
+        if (btn_inc.press_time) {
+            uint32_t d = now - btn_inc.press_time;
+            if (d >= LONG_PRESS_MS) btn_inc.long_event = true;
+            else btn_inc.short_event = true;
+        }
+        btn_inc.press_time = 0;
+    }
+    btn_inc.last_raw = raw;
+
+    /* DEC */
+    raw = ReadRaw(btn_dec.pin);
+    if (raw && !btn_dec.last_raw) { btn_dec.press_time = now; }
+    else if (!raw && btn_dec.last_raw) {
+        if (btn_dec.press_time) {
+            uint32_t d = now - btn_dec.press_time;
+            if (d >= LONG_PRESS_MS) btn_dec.long_event = true;
+            else btn_dec.short_event = true;
+        }
+        btn_dec.press_time = 0;
+    }
+    btn_dec.last_raw = raw;
+}
+
+/* Toggle backlight */
+static void toggle_backlight(void)
+{
+    backlight_state = (backlight_state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+    HAL_GPIO_WritePin(Baklit_GPIO_Port, Baklit_Pin, backlight_state);
+}
+
+/* Draw selection screen (short text) - no clearing, just write lines */
+static void draw_select_screen(void)
+{
+    /* line 1 */
+    LCD_GotoXY(0,0);
+    LCD_PutString("Press +/- (Mid)   "); /* keep 16 chars */
+    /* line 2: H : xx ,M : yy  - we won't blink here */
+    char line2[17];
+    snprintf(line2, sizeof(line2), "H:%02d ,M:%02d     ", hour, minute);
+    LCD_GotoXY(0,1);
+    LCD_PutString(line2);
+}
+
+/* Draw edit screen: blink only selected number by replacing digits with spaces when blink_off */
+static void draw_edit_screen(bool blink_on)
+{
+    LCD_GotoXY(0,0);
+    LCD_PutString("Press +/- to edit   "); /* 16 chars */
+    char line2[17];
+    if (sel_field == FIELD_HOUR) {
+        if (blink_on) snprintf(line2, sizeof(line2), "H:%02d ,M:%02d     ", hour, minute);
+        else         snprintf(line2, sizeof(line2), "H:   ,M:%02d     ", minute); /* hide hour digits */
+    } else {
+        if (blink_on) snprintf(line2, sizeof(line2), "H:%02d ,M:%02d     ", hour, minute);
+        else         snprintf(line2, sizeof(line2), "H:%02d ,M:       ", hour);   /* hide min digits */
+    }
+    LCD_GotoXY(0,1);
+    LCD_PutString(line2);
+}
+
+/* Draw repeat selection */
+static void draw_repeat_screen(void)
+{
+    LCD_GotoXY(0,0); LCD_PutString("Choose repeat Value");
+    LCD_GotoXY(0,1);
+    if (repeat_value < 0) {
+        LCD_PutString("    X (infinite)    ");
+    } else {
+        char b[17]; snprintf(b, sizeof(b), "       %4ld         ", (long)repeat_value);
+        LCD_PutString(b);
+    }
+}
+
+/* Draw run screen */
+static void draw_run_screen(void)
+{
+    char l1[17], l2[17];
+    uint32_t tot = phase_remaining / 1000;
+    uint32_t hh = tot / 3600;
+    uint32_t mm = (tot % 3600) / 60;
+    uint32_t ss = tot % 60;
+    snprintf(l1, sizeof(l1), "%02u:%02u:%02u %s  ", (unsigned)hh, (unsigned)mm, (unsigned)ss, phase_on ? "On" : "Off");
+    if (repeat_value < 0) snprintf(l2, sizeof(l2), "Cycle: %ld (inf)   ", (long)cycles_done);
+    else                  snprintf(l2, sizeof(l2), "Cycle: %ld/%ld       ", (long)cycles_done, (long)repeat_value);
+    LCD_GotoXY(0,0); LCD_PutString(l1);
+    LCD_GotoXY(0,1); LCD_PutString(l2);
+}
+
+/* ---------- handlers ---------- */
+
+/* ADJUST_SELECT: +/- toggles selection, Set short enters edit, Set long toggles backlight */
+static void handle_adjust_select(void)
+{
+    if (btn_inc.short_event) { btn_inc.short_event = false; sel_field = (sel_field == FIELD_HOUR) ? FIELD_MINUTE : FIELD_HOUR; }
+    if (btn_dec.short_event) { btn_dec.short_event = false; sel_field = (sel_field == FIELD_HOUR) ? FIELD_MINUTE : FIELD_HOUR; }
+
+    if (btn_set.long_event) { btn_set.long_event = false; toggle_backlight(); }
+    if (btn_set.short_event) { btn_set.short_event = false; timerState = ADJUST_EDIT; }
+}
+
+/* ADJUST_EDIT: +/- changes the selected value; Set short confirms (hour->minute->repeat) */
+static void handle_adjust_edit(void)
+{
+    if (btn_inc.short_event) {
+        btn_inc.short_event = false;
+        if (sel_field == FIELD_HOUR) hour = (hour + 1) % 24;
+        else minute = (minute + 1) % 60;
+    }
+    if (btn_dec.short_event) {
+        btn_dec.short_event = false;
+        if (sel_field == FIELD_HOUR) hour = (hour - 1 + 24) % 24;
+        else minute = (minute - 1 + 60) % 60;
+    }
+    if (btn_set.long_event) { btn_set.long_event = false; toggle_backlight(); }
+
+    if (btn_set.short_event) {
+        btn_set.short_event = false;
+        if (sel_field == FIELD_HOUR) {
+            /* finish editing hour -> edit minute */
+            sel_field = FIELD_MINUTE;
+            timerState = ADJUST_EDIT; /* stay in edit */
+        } else {
+            /* finished minute -> go to repeat selection */
+            timerState = CHOOSE_REPEAT;
+            /* leave repeat_value as current (default 0) */
+        }
+    }
+}
+
+/* CHOOSE_REPEAT: + increments, - decrements (with X cycle), Set confirms; long set toggles backlight */
+static void handle_choose_repeat(void)
+{
+    if (btn_inc.short_event) {
+        btn_inc.short_event = false;
+        if (repeat_value < 0) repeat_value = 0;
+        else if (repeat_value < 1000) repeat_value++;
+    }
+    if (btn_dec.short_event) {
+        btn_dec.short_event = false;
+        if (repeat_value <= 0) repeat_value = -1; /* X */
+        else repeat_value--;
+    }
+    if (btn_set.long_event) { btn_set.long_event = false; toggle_backlight(); }
+    if (btn_set.short_event) {
+        btn_set.short_event = false;
+        if (hour == 0 && minute == 0) {
+            /* error and back to select */
+            LCD_GotoXY(0,0); LCD_PutString("  Error!           ");
+            LCD_GotoXY(0,1); LCD_PutString(" Try again!        ");
+            uint32_t t = HAL_GetTick();
+            while ((HAL_GetTick() - t) < 2000) {}
+            timerState = ADJUST_SELECT;
+        } else {
+            timerState = RUN_CYCLE;
+            run_init = false;
+        }
+    }
+    draw_repeat_screen();
+}
+
+/* RUN_CYCLE: non-blocking; Set short stops and returns to ADJUST_SELECT */
+static void handle_run_cycle(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (!run_init) {
+        phase_ms = ((uint32_t)hour * 3600u + (uint32_t)minute * 60u) * 1000u;
+        if (phase_ms == 0) { timerState = ADJUST_SELECT; return; }
+        phase_on = true;
+        phase_remaining = phase_ms;
+        last_phase_tick = now;
+        cycles_done = 0;
+        run_init = true;
+        HAL_GPIO_WritePin(Rel_GPIO_Port, Rel_Pin, GPIO_PIN_SET);
+        draw_run_screen();
+        return;
+    }
+
+    if (btn_set.short_event) { btn_set.short_event = false; run_init = false; HAL_GPIO_WritePin(Rel_GPIO_Port, Rel_Pin, GPIO_PIN_RESET); timerState = ADJUST_SELECT; return; }
+    if (btn_set.long_event)  { btn_set.long_event = false; toggle_backlight(); }
+
+    uint32_t elapsed = now - last_phase_tick;
+    if (elapsed > 0) {
+        if (phase_remaining > elapsed) phase_remaining -= elapsed; else phase_remaining = 0;
+        last_phase_tick = now;
+    }
+
+    if (phase_remaining == 0) {
+        if (phase_on) {
+            phase_on = false;
+            HAL_GPIO_WritePin(Rel_GPIO_Port, Rel_Pin, GPIO_PIN_RESET);
+            phase_remaining = phase_ms;
+        } else {
+            phase_on = true;
+            HAL_GPIO_WritePin(Rel_GPIO_Port, Rel_Pin, GPIO_PIN_SET);
+            phase_remaining = phase_ms;
+            cycles_done++;
+            if (repeat_value >= 1 && cycles_done >= repeat_value) {
+                run_init = false;
+                HAL_GPIO_WritePin(Rel_GPIO_Port, Rel_Pin, GPIO_PIN_RESET);
+                timerState = ADJUST_SELECT;
+                return;
+            }
+        }
+    }
+
+    static uint32_t last_run_ui = 0;
+    if ((now - last_run_ui) >= UI_UPDATE_MS) { last_run_ui = now; draw_run_screen(); }
+}
+
+/* ---------- main ---------- */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+
+    /* init button structs */
+    btn_set.pin = SetBut_Pin; btn_set.last_raw = ReadRaw(SetBut_Pin); btn_set.press_time = 0; btn_set.short_event = btn_set.long_event = false;
+    btn_inc.pin = IncBut_Pin; btn_inc.last_raw = ReadRaw(IncBut_Pin); btn_inc.press_time = 0; btn_inc.short_event = btn_inc.long_event = false;
+    btn_dec.pin = DecBut_Pin; btn_dec.last_raw = ReadRaw(DecBut_Pin); btn_dec.press_time = 0; btn_dec.short_event = btn_dec.long_event = false;
+
+    /* backlight on */
+    backlight_state = GPIO_PIN_SET;
+    HAL_GPIO_WritePin(Baklit_GPIO_Port, Baklit_Pin, backlight_state);
+
+    /* splash slower */
+    LCD_Init();
+    LCD_GotoXY(0,0); LCD_PutString("M_A_P_timer       ");
+    for (int i = 0; i < 5; ++i) { LCD_Shift(1, LCD_SHIFT_TO_RIGHT, 400); HAL_Delay(400); }
+    HAL_Delay(300);
+    LCD_GotoXY(0,0); LCD_PutString("                ");
+    LCD_GotoXY(0,1); LCD_PutString("                ");
+
+    /* defaults */
+    sel_field = FIELD_HOUR; hour = 0; minute = 0; repeat_value = 0;
+    timerState = ADJUST_SELECT;
+    last_ui_tick = HAL_GetTick();
+
+    /* main loop */
+    while (1) {
+        sample_buttons_simple();
+
+        switch (timerState) {
+            case ADJUST_SELECT:
+                handle_adjust_select();
+                if (btn_inc.short_event || btn_dec.short_event || (HAL_GetTick() - last_ui_tick) >= UI_UPDATE_MS) {
+                    last_ui_tick = HAL_GetTick();
+                    draw_select_screen();
+                }
+                break;
+
+            case ADJUST_EDIT: {
+                handle_adjust_edit();
+                /* blinking only the selected digits */
+                static uint32_t last_blink = 0;
+                static bool blink_on = true;
+                uint32_t now = HAL_GetTick();
+                if ((now - last_blink) >= BLINK_MS) { blink_on = !blink_on; last_blink = now; }
+                if (btn_inc.short_event || btn_dec.short_event || (now - last_ui_tick) >= UI_UPDATE_MS) {
+                    last_ui_tick = now;
+                    draw_edit_screen(blink_on);
+                }
+                break;
+            }
+
+            case CHOOSE_REPEAT:
+                handle_choose_repeat();
+                break;
+
+            case RUN_CYCLE:
+                handle_run_cycle();
+                break;
+        }
+    }
+}
+
+/* ---------- MX_GPIO_Init & SystemClock_Config (paste or keep your existing ones) ---------- */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOA, D4_Pin|Rel_Pin|D5_Pin|D6_Pin|D7_Pin|LCDRs_Pin|Baklit_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LCDEn_GPIO_Port, LCDEn_Pin, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = D4_Pin|Rel_Pin|D5_Pin|D6_Pin|D7_Pin|LCDRs_Pin|Baklit_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = SetBut_Pin|IncBut_Pin|DecBut_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = LCDEn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LCDEn_GPIO_Port, &GPIO_InitStruct);
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL12;
+  RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) { Error_Handler(); }
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
