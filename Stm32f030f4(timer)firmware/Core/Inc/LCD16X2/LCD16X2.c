@@ -81,30 +81,86 @@ void LCD16X2_Set_Cursor(uint8_t LCD16X2_Index, unsigned char r, unsigned char c)
 
 void LCD16X2_Init(uint8_t LCD16X2_Index)
 {
-	// According To Datasheet, We Must Wait At Least 40ms After Power Up Before Interacting With The LCD Module
-	while(HAL_GetTick() < 50);
-	// The Init. Procedure As Described In The Datasheet
-	HAL_GPIO_WritePin(LCD16X2_CfgParam[LCD16X2_Index].RS_GPIOx, LCD16X2_CfgParam[LCD16X2_Index].RS_PINx, 0);
-	HAL_GPIO_WritePin(LCD16X2_CfgParam[LCD16X2_Index].EN_GPIOx, LCD16X2_CfgParam[LCD16X2_Index].EN_PINx, 0);
-    // Init in 4-Bit Data Mode
-	LCD16X2_DATA(LCD16X2_Index, 0x00);
-    DELAY_MS(150);
+    /*
+     * HD44780 startup:
+     * Wait at least 40 ms after LCD power becomes stable.
+     * 100 ms is used here for extra robustness.
+     */
+    DELAY_MS(100);
+
+    /* Make sure control lines start inactive */
+    HAL_GPIO_WritePin(
+        LCD16X2_CfgParam[LCD16X2_Index].RS_GPIOx,
+        LCD16X2_CfgParam[LCD16X2_Index].RS_PINx,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        LCD16X2_CfgParam[LCD16X2_Index].EN_GPIOx,
+        LCD16X2_CfgParam[LCD16X2_Index].EN_PINx,
+        GPIO_PIN_RESET
+    );
+
+    /*
+     * Make data bus known.
+     * This is especially useful after MCU-only reset,
+     * because the LCD itself was NOT reset.
+     */
+    LCD16X2_DATA(LCD16X2_Index, 0x00);
+
+    DELAY_MS(10);
+
+    /*
+     * Force LCD into 8-bit communication state.
+     * Send 0x03 three times as required by HD44780 startup.
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x03);
     DELAY_MS(5);
+
     LCD16X2_CMD(LCD16X2_Index, 0x03);
     DELAY_MS(5);
+
     LCD16X2_CMD(LCD16X2_Index, 0x03);
-    DELAY_US(150);
-    // The Rest of The Init Sequence As Defined in The Hitachi HD44780 Datasheet
+    DELAY_US(200);
+
+    /*
+     * Switch LCD to 4-bit mode.
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x02);
+    DELAY_US(200);
+
+    /*
+     * Function Set:
+     * 4-bit
+     * 2 lines
+     * 5x8 font
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x02);
     LCD16X2_CMD(LCD16X2_Index, 0x08);
+
+    /*
+     * Display ON
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x00);
     LCD16X2_CMD(LCD16X2_Index, 0x0C);
+
+    /*
+     * Entry mode
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x00);
     LCD16X2_CMD(LCD16X2_Index, 0x06);
+
+    /*
+     * Clear display
+     */
     LCD16X2_CMD(LCD16X2_Index, 0x00);
     LCD16X2_CMD(LCD16X2_Index, 0x01);
+
+    /*
+     * IMPORTANT:
+     * CLEAR DISPLAY needs ~1.5 ms.
+     */
+    DELAY_MS(2);
 }
 
 void LCD16X2_Write_Char(uint8_t LCD16X2_Index, char Data)

@@ -47,3 +47,8 @@ Backup of *
 *.dbgdt
 *.dnx
 *.wsdt
+.freebuff/
+*.wsdt
+*.dnx
+*.wsdt
+*.dnx
